@@ -1,0 +1,21 @@
+project:
+  type: book
+
+book:
+  title: "ds6030"
+  author: "Khue Nguyen"
+  date: "9/13/2026"
+  chapters:
+    - index.qmd
+    - intro.qmd
+
+
+bibliography: references.bib
+
+format:
+  html:
+    theme:
+      - cosmo
+      - brand
+  pdf:
+    documentclass: scrreprt
