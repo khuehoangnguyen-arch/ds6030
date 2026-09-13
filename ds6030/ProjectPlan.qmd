@@ -1,0 +1,333 @@
+# Pre-processing
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+# Joining the two datasets by building_id
+
+library(tidyverse)
+library(tidymodels)
+
+train_values <- read_csv("train_values.csv")
+train_labels <- read_csv("train_labels.csv")
+
+earthquake <- train_values |>
+  left_join(train_labels, by = "building_id")
+```
+
+```{r}
+# Check what the data looks like, check for missing values
+
+glimpse(earthquake)
+summary(earthquake)
+colSums(is.na(earthquake))
+```
+
+For this project, building_id has no predictive power, and keeping it would only introduce noise into the dataset, so I decided to drop it. Additionally, has_secondary_use is 1 whenever any detailed secondary-use flag is 1, making it redundant if we include all of the detailed indicators. That's why I'm also dropping that one. 
+
+```{r}
+# Drop building_id column, as well as the redundant has_secondary_use column
+earthquake <- earthquake |>
+  select(-building_id, -has_secondary_use)
+
+# Convert categorical variables to factors
+earthquake <- earthquake |>
+  mutate(
+    land_surface_condition = factor(land_surface_condition),
+    foundation_type = factor(foundation_type),
+    roof_type = factor(roof_type),
+    ground_floor_type = factor(ground_floor_type),
+    other_floor_type = factor(other_floor_type),
+    position = factor(position),
+    plan_configuration = factor(plan_configuration),
+    legal_ownership_status = factor(legal_ownership_status),
+    damage_grade = factor(damage_grade, levels = c(1, 2, 3), ordered = TRUE),
+    geo_level_1_id = factor(geo_level_1_id),
+    geo_level_2_id = factor(geo_level_2_id),
+    geo_level_3_id = factor(geo_level_3_id)
+  )
+```
+
+# Exploratory Data Analysis
+
+## Inspecting the numeric variables
+
+```{r}
+library(ggplot2)
+library(patchwork)
+# Inspect distribution
+
+earthquake |>
+  select(
+    count_floors_pre_eq,
+    age,
+    area_percentage,
+    height_percentage,
+    count_families
+  ) |>
+  pivot_longer(
+    everything(),
+    names_to = "variable",
+    values_to = "value"
+  ) |>
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 30) +
+  facet_wrap(~ variable, scales = "free")
+```
+
+Most distributions are slightly right-skewed, except for age which is extremely right-skewed, with a noticeable number of observations near the 1000 mark, which requires further investigation.
+
+```{r}
+# Investigate age
+earthquake |>
+  count(age) |>
+  arrange(desc(age)) |>
+  head(20)
+```
+
+There's an exceptionally large number of observations at age == 995, which suggests it has a special meaning rather than being the actual age of a building.
+
+## Dealing with geo_level_id
+
+While the categorical variable geo_level_1_id only has 31 unique values, geo_level_2_id has over 1400, and geo_level_3_id has over 12,000. My assumption is that geo_level_1_id represents the the largest region, and that observations with the same geo_level_1_id would have different geo_level_2_id, implying a nested nested structure of geographic hierarchy. To test this assumption, I'll check whether there are any observation with the same geo_level_1_id, but different geo_level_2_id, and the same for 2 and 3, as well as 1 and 3
+
+```{r}
+# check whether there are any observation with the same geo_level_1_id, but different geo_level_2_id
+earthquake |>
+  distinct(geo_level_1_id, geo_level_2_id) |>
+  count(geo_level_2_id) |>
+  filter(n > 1)
+```
+
+```{r}
+# check whether there are any observation with the same geo_level_2_id, but different geo_level_3_id
+earthquake |>
+  distinct(geo_level_2_id, geo_level_3_id) |>
+  count(geo_level_3_id) |>
+  filter(n > 1)
+```
+
+```{r}
+# check whether there are any observation with the same geo_level_1_id, but different geo_level_3_id
+earthquake |>
+  distinct(geo_level_1_id, geo_level_3_id) |>
+  count(geo_level_3_id) |>
+  filter(n > 1)
+```
+
+So my assumption was correct, and the geographic ids are nested, now I want to test whether there are substantial variance in levels of damage across geographic regions. We start from large to small (level_1_ids, and then different level_2_ids within the same level_1_ids, and then different level_3_ids within the same level_2_ids)
+
+```{r}
+# Investigate whether damage grade differs substantially by geographic region
+
+geo_order <- earthquake |>
+  mutate(damage_num = as.numeric(as.character(damage_grade))) |>
+  group_by(geo_level_1_id) |>
+  summarise(
+    mean_damage = mean(damage_num)
+  ) |>
+  arrange(mean_damage)
+
+geo1_damage <- earthquake |>
+  mutate(
+    geo_level_1_id = factor(
+      geo_level_1_id,
+      levels = geo_order$geo_level_1_id
+    )
+  ) |>
+  count(geo_level_1_id, damage_grade) |>
+  group_by(geo_level_1_id) |>
+  mutate(prop = n / sum(n))
+
+ggplot(
+  geo1_damage,
+  aes(x = geo_level_1_id, y = prop, fill = damage_grade)
+) +
+  geom_col() +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    x = "Geographic Level 1",
+    y = "Proportion of Buildings",
+    fill = "Damage Grade"
+  ) +
+  theme(
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1
+    )
+  )
+```
+
+Based on the visualization, there IS substantial damage grade variation across geographic regions, which justify keeping the first level of geographic ids.
+
+For level 2, I'll examine all the level-2 regions within the same level-1 region id 6:
+
+```{r}
+geo_order <- earthquake |>
+  mutate(damage_num = as.numeric(as.character(damage_grade))) |>
+  group_by(geo_level_2_id) |>
+  summarise(
+    mean_damage = mean(damage_num)
+  ) |>
+  arrange(mean_damage)
+
+geo2_damage <- earthquake |>
+  mutate(
+    geo_level_2_id = factor(
+      geo_level_2_id,
+      levels = geo_order$geo_level_2_id
+    )
+  )|>
+  count(
+    geo_level_1_id,
+    geo_level_2_id,
+    damage_grade
+  ) |>
+  group_by(
+    geo_level_1_id,
+    geo_level_2_id
+  ) |>
+  mutate(
+    prop = n / sum(n)
+  ) |>
+  ungroup()
+
+geo2_damage |>
+  filter(geo_level_1_id == 6) |>
+  ggplot(
+    aes(
+      x = geo_level_2_id,
+      y = prop,
+      fill = damage_grade
+    )
+  ) +
+  geom_col() +
+  scale_y_continuous(
+    labels = scales::percent
+  ) +
+  labs(
+    x = "Geographic Level 2",
+    y = "Proportion of Buildings",
+    fill = "Damage Grade"
+  ) +
+  theme(
+    axis.text.x = element_text(
+      angle = 90,
+      hjust = 1
+    )
+  )
+```
+
+Based on the visualization, there is substantial variation in levels of damage within the same level-1 region as well, which justifies keeping the second level of geographical id.
+
+For level 3, I'll examine all the level-3 regions within the same level-2 region id 487:
+
+```{r}
+geo_order <- earthquake |>
+  mutate(damage_num = as.numeric(as.character(damage_grade))) |>
+  group_by(geo_level_3_id) |>
+  summarise(
+    mean_damage = mean(damage_num)
+  ) |>
+  arrange(mean_damage)
+
+geo3_damage <- earthquake |>
+  mutate(
+    geo_level_3_id = factor(
+      geo_level_3_id,
+      levels = geo_order$geo_level_3_id
+    )
+  )|>
+  count(
+    geo_level_2_id,
+    geo_level_3_id,
+    damage_grade
+  ) |>
+  group_by(
+    geo_level_2_id,
+    geo_level_3_id
+  ) |>
+  mutate(
+    prop = n / sum(n)
+  ) |>
+  ungroup()
+
+geo3_damage |>
+  filter(geo_level_2_id == 487) |>
+  ggplot(
+    aes(
+      x = geo_level_3_id,
+      y = prop,
+      fill = damage_grade
+    )
+  ) +
+  geom_col() +
+  scale_y_continuous(
+    labels = scales::percent
+  ) +
+  labs(
+    x = "Geographic Level 3",
+    y = "Proportion of Buildings",
+    fill = "Damage Grade"
+  ) +
+  theme(
+    axis.text.x = element_text(
+      angle = 90,
+      hjust = 1
+    )
+  )
+```
+
+There is variation among the third level of geographic id as well, but seemingly not as pronounced as the first two levels. However, I don't know if every second-level region looks like this, it got me thinking: On average, how many third-level region is in one second-level region? And how many second-level region is in one first-level region? Because here's the rationale: the more sub-regions are contained within one region, the more likely the effect of an earthquake will be varied across said sub-regions. 
+
+That's why I'll count how many level-2 regions is inside each level-1 region, and how many level-3 region is inside each level-2 region
+
+```{r}
+# counting level-2 regions
+geo1_counts <- earthquake |>
+  group_by(geo_level_1_id) |>
+  summarise(
+    n_geo_level_2 = n_distinct(geo_level_2_id),
+    .groups = "drop"
+  ) |>
+  arrange(desc(n_geo_level_2))
+
+geo1_counts
+summary(geo1_counts$n_geo_level_2)
+```
+
+```{r}
+# counting level-3 regions
+
+geo2_counts <- earthquake |>
+  group_by(
+    geo_level_1_id,
+    geo_level_2_id
+  ) |>
+  summarise(
+    n_geo_level_3 = n_distinct(geo_level_3_id),
+    .groups = "drop"
+  ) |>
+  arrange(desc(n_geo_level_3))
+
+geo2_counts
+summary(geo2_counts$n_geo_level_3)
+```
+
+So on average, each level-1 region contains around 46 level-2 regions, while each level-2 regions only contain 8 level-3 regions. For this reason, I think there is definitely an argument to roll the level-3 geographical data into fewer categories, or just outright dropping it.
+
+## Inspecting the remaining categorical variables (to be added later)
+
+# Train-test split
+
+Because Grade 2 is the most common damage level and grade 1 the least common, I'll split the data 80/20 into the training and test set, stratified on damage_grade
+
+```{r}
+
+set.seed(98)
+
+earthquake_split <- initial_split(earthquake, prop = 0.8, strata = damage_grade)
+
+train <- training(earthquake_split)
+test <- testing(earthquake_split)
+```
+
+
