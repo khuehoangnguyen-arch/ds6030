@@ -85,6 +85,46 @@ earthquake |>
 
 There's an exceptionally large number of observations at age == 995, which suggests it has a special meaning rather than being the actual age of a building.
 
+```{r}
+library(GGally)
+
+# 1. Select numerical predictors with log transformations and damage_grade as numeric
+numerical_vars <- earthquake |>
+  mutate(
+    damage_grade = as.numeric(as.character(damage_grade)),
+    log_age = log(age + 1),
+    log_height_percentage = log(height_percentage)
+  ) |>
+  select(
+    damage_grade,
+    count_floors_pre_eq,
+    log_age,
+    area_percentage,
+    log_height_percentage,
+    count_families
+  )
+
+# 2. Compute correlation matrix & find the most correlated numerical predictor with damage_grade
+correlations_table <- cor(numerical_vars, use = "pairwise.complete.obs")
+correlations <- correlations_table["damage_grade", ]
+correlations <- correlations[names(correlations) != "damage_grade"]
+
+# Predictor with strongest correlation:
+most_correlated <- names(correlations)[which.max(abs(correlations))]
+most_correlated
+
+# 3. Pairwise plot with damage_grade and numerical predictors
+# (Sampling rows is recommended if dataset is large, e.g. slice_sample(n = 2000))
+GGally::ggpairs(
+  numerical_vars |> slice_sample(n = min(2000, nrow(numerical_vars))),
+  lower = list(
+    continuous = GGally::wrap(
+      "smooth", method = "lm", se = FALSE, alpha = 0.25
+    )
+  )
+)
+```
+
 ## Dealing with geo_level_id
 
 While the categorical variable geo_level_1_id only has 31 unique values, geo_level_2_id has over 1400, and geo_level_3_id has over 12,000. My assumption is that geo_level_1_id represents the the largest region, and that observations with the same geo_level_1_id would have different geo_level_2_id, implying a nested nested structure of geographic hierarchy. To test this assumption, I'll check whether there are any observation with the same geo_level_1_id, but different geo_level_2_id, and the same for 2 and 3, as well as 1 and 3
@@ -314,7 +354,214 @@ summary(geo2_counts$n_geo_level_3)
 
 So on average, each level-1 region contains around 46 level-2 regions, while each level-2 regions only contain 8 level-3 regions. For this reason, I think there is definitely an argument to roll the level-3 geographical data into fewer categories, or just outright dropping it.
 
-## Inspecting the remaining categorical variables (to be added later)
+
+
+```{r}
+# Order geo_level_1_id by overall mean damage
+geo1_order <- earthquake |>
+  mutate(damage_num = as.numeric(as.character(damage_grade))) |>
+  group_by(geo_level_1_id) |>
+  summarise(mean_damage_geo1 = mean(damage_num), .groups = "drop") |>
+  arrange(mean_damage_geo1)
+
+# Order geo_level_2_id hierarchically:
+# First by geo_level_1_id mean damage, then by geo_level_2_id mean damage within each level 1
+geo2_order <- earthquake |>
+  mutate(damage_num = as.numeric(as.character(damage_grade))) |>
+  group_by(geo_level_1_id, geo_level_2_id) |>
+  summarise(mean_damage_geo2 = mean(damage_num), .groups = "drop") |>
+  left_join(geo1_order, by = "geo_level_1_id") |>
+  arrange(mean_damage_geo1, mean_damage_geo2)
+
+# Compute proportions of damage grade per geo_level_2_id
+geo2_damage_all <- earthquake |>
+  mutate(
+    geo_level_1_id = factor(geo_level_1_id, levels = geo1_order$geo_level_1_id),
+    geo_level_2_id = factor(geo_level_2_id, levels = geo2_order$geo_level_2_id)
+  ) |>
+  count(geo_level_1_id, geo_level_2_id, damage_grade) |>
+  group_by(geo_level_1_id, geo_level_2_id) |>
+  mutate(prop = n / sum(n)) |>
+  ungroup()
+
+# Plot faceted across level 1 regions (preserving level 1 order)
+ggplot(
+  geo2_damage_all,
+  aes(x = geo_level_2_id, y = prop, fill = damage_grade)
+) +
+  geom_col(position = "stack") +
+  facet_wrap(~ geo_level_1_id, scales = "free_x") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    x = "Geographic Level 2 (grouped by Geographic Level 1)",
+    y = "Proportion of Buildings",
+    fill = "Damage Grade"
+  ) +
+  theme(
+    axis.text.x = element_blank(),  # hides tick labels for readability due to 1400+ IDs
+    axis.ticks.x = element_blank()
+  )
+```
+
+```{r}
+# Level 3 regions within Level 2 groups, filtered for Level 1 group 2
+# We can use another grou, this one just seemed to follow the overall trend of the data
+
+# Filter data for geo_level_1_id == 2
+earthquake_geo1_2 <- earthquake |>
+  filter(geo_level_1_id == 2)
+
+#  Order geo_level_2_id within geo_level_1_id == 2 by mean damage
+geo2_order_g2 <- earthquake_geo1_2 |>
+  mutate(damage_num = as.numeric(as.character(damage_grade))) |>
+  group_by(geo_level_2_id) |>
+  summarise(mean_damage_geo2 = mean(damage_num), .groups = "drop") |>
+  arrange(mean_damage_geo2)
+
+#  Order geo_level_3_id hierarchically:
+#    First by geo_level_2_id mean damage, then by geo_level_3_id mean damage within each level 2
+geo3_order_g2 <- earthquake_geo1_2 |>
+  mutate(damage_num = as.numeric(as.character(damage_grade))) |>
+  group_by(geo_level_2_id, geo_level_3_id) |>
+  summarise(mean_damage_geo3 = mean(damage_num), .groups = "drop") |>
+  left_join(geo2_order_g2, by = "geo_level_2_id") |>
+  arrange(mean_damage_geo2, mean_damage_geo3)
+
+# Compute proportions of damage grade per geo_level_3_id
+geo3_damage_g2 <- earthquake_geo1_2 |>
+  mutate(
+    geo_level_2_id = factor(geo_level_2_id, levels = geo2_order_g2$geo_level_2_id),
+    geo_level_3_id = factor(geo_level_3_id, levels = geo3_order_g2$geo_level_3_id)
+  ) |>
+  count(geo_level_2_id, geo_level_3_id, damage_grade) |>
+  group_by(geo_level_2_id, geo_level_3_id) |>
+  mutate(prop = n / sum(n)) |>
+  ungroup()
+
+# Plot faceted across level 2 regions within level 1 group 2
+ggplot(
+  geo3_damage_g2,
+  aes(x = geo_level_3_id, y = prop, fill = damage_grade)
+) +
+  geom_col(position = "stack") +
+  facet_wrap(~ geo_level_2_id, scales = "free_x") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Level 3 Damage Proportions within Level 2 Regions (for Level 1 = 2)",
+    x = "Geographic Level 3 (grouped by Geographic Level 2)",
+    y = "Proportion of Buildings",
+    fill = "Damage Grade"
+  ) +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank()
+  )
+```
+
+```{r}
+# Summary statistics on building counts (rows) per geo_level_3_id
+geo3_row_counts <- earthquake |>
+  count(geo_level_3_id, name = "n_buildings")
+
+summary(geo3_row_counts$n_buildings)
+
+# Distribution plot of building counts per level 3 region
+ggplot(geo3_row_counts, aes(x = n_buildings)) +
+  geom_histogram(bins = 50) +
+  scale_x_log10() +
+  labs(
+    title = "Distribution of Building Counts per Geo Level 3 Region (log10 scale)",
+    x = "Number of Buildings (Rows)",
+    y = "Count of Level 3 Regions"
+  )
+```
+
+## Inspecting the remaining categorical variables
+
+```{r, fig.width=14, fig.height=14, out.width="100%"}
+# Select categorical variables (excluding high-cardinality geo_level IDs) and numeric damage_grade
+cat_vars <- c(
+  "land_surface_condition",
+  "foundation_type",
+  "roof_type",
+  "ground_floor_type",
+  "other_floor_type",
+  "position",
+  "plan_configuration",
+  "legal_ownership_status"
+)
+
+cat_data <- earthquake |>
+  mutate(damage_grade_num = as.numeric(as.character(damage_grade))) |>
+  select(all_of(cat_vars), damage_grade_num)
+
+# GGally ggpairs with boxplots for categorical vs numeric damage_grade
+GGally::ggpairs(
+  cat_data |> slice_sample(n = min(2000, nrow(cat_data))),
+  columns = c(cat_vars, "damage_grade_num"),
+  lower = list(
+    combo = GGally::wrap("box_no_facet", alpha = 0.25)
+  )
+)
+```
+
+```{r, fig.width=12, fig.height=10}
+# Compute correlation ratio (eta = sqrt(R^2)) for each categorical variable
+cat_correlations <- purrr::map_dfr(cat_vars, function(var) {
+  model <- lm(as.formula(paste("damage_grade_num ~", var)), data = cat_data)
+  r_squared <- summary(model)$r.squared
+  tibble::tibble(
+    variable = var,
+    eta = sqrt(r_squared),
+    r_squared = r_squared
+  )
+}) |>
+  arrange(desc(eta))
+
+# Compute category-level summary stats (mean damage & frequency)
+category_level_stats <- purrr::map_dfr(cat_vars, function(var) {
+  earthquake |>
+    mutate(damage_num = as.numeric(as.character(damage_grade))) |>
+    group_by(category_level = as.character(.data[[var]])) |>
+    summarise(
+      variable = var,
+      n = n(),
+      mean_damage = mean(damage_num),
+      prop_grade_3 = mean(damage_num == 3),
+      .groups = "drop"
+    )
+}) |>
+  arrange(desc(mean_damage))
+
+# Join overall eta to category-level stats
+plot_cat_data <- category_level_stats |>
+  left_join(cat_correlations, by = "variable") |>
+  mutate(
+    facet_label = paste0(variable, " (eta = ", round(eta, 3), ")"),
+    facet_label = reorder(facet_label, -eta)
+  )
+
+# Plot categories ranked by mean damage with eta annotated
+ggplot(plot_cat_data, aes(x = reorder(category_level, mean_damage), y = mean_damage, fill = mean_damage)) +
+  geom_col() +
+  geom_text(
+    aes(label = sprintf("%.2f (n=%d)", mean_damage, n)),
+    hjust = 1.1,
+    color = "white",
+    size = 3
+  ) +
+  coord_flip() +
+  facet_wrap(~ facet_label, scales = "free_y") +
+  scale_fill_viridis_c(option = "plasma", name = "Mean Damage") +
+  labs(
+    title = "Categorical Predictors Ranked by Association with Damage Grade",
+    subtitle = "Faceted by variable (ordered by eta); categories sorted by mean damage grade (1 to 3)",
+    x = "Category Level",
+    y = "Mean Damage Grade (1 = Low, 3 = High)"
+  ) +
+  theme_minimal() +
+  theme(strip.text = element_text(face = "bold"))
+```
 
 # Train-test split
 
